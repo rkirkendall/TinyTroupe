@@ -9,6 +9,7 @@ from typing import Union
 
 
 import tiktoken
+from pydantic import BaseModel
 from tinytroupe import utils
 from tinytroupe.control import transactional
 from tinytroupe import default
@@ -234,9 +235,8 @@ class OpenAIClient:
         override this method to implement their own API calls.
         """   
         
-        # If we are in LEGACY mode or response_format is provided (Pydantic path today), use legacy chat.completions
-        # This preserves current behavior for structured outputs while we migrate modules incrementally.
-        use_legacy = (self.api_mode != "responses") or ("response_format" in chat_api_params and chat_api_params["response_format"] is not None)
+        # Prefer Responses API when enabled; otherwise use legacy chat.completions
+        use_legacy = (self.api_mode != "responses")
 
         if use_legacy:
             # adjust parameters depending on the model (legacy path)
@@ -264,16 +264,26 @@ class OpenAIClient:
                 logger.debug(f"Calling legacy chat.completions.create with params: {logged_params} (messages omitted).")
                 return self.client.chat.completions.create(**chat_api_params)
 
-        # RESPONSES API path (no response_format in params)
+        # RESPONSES API path
+        rf = chat_api_params.get("response_format")
+        is_pydantic = isinstance(rf, type) and issubclass(rf, BaseModel)
+
         responses_params = self._map_messages_to_responses_params(model, chat_api_params)
         logged_params = {k: v for k, v in responses_params.items() if k != "input"}
-        logger.debug(f"Calling Responses API with params: {logged_params} (input omitted).")
+
+        if is_pydantic:
+            # Structured output via responses.parse with Pydantic text_format
+            logger.debug(f"Calling Responses API parse with params: {logged_params} (input omitted).")
+            return self.client.responses.parse(text_format=rf, **responses_params)
+
+        # Unstructured path
+        logger.debug(f"Calling Responses API create with params: {logged_params} (input omitted).")
         return self.client.responses.create(**responses_params)
 
     def _map_messages_to_responses_params(self, model, chat_api_params):
         """
         Convert legacy chat parameters into Responses API parameters.
-        - messages -> input (list of message dicts with content blocks)
+        - messages -> input (list of message dicts with plain string content)
         - max_tokens -> max_output_tokens
         - for reasoning models: set reasoning.effort and drop unsupported fields
         """
@@ -284,7 +294,7 @@ class OpenAIClient:
             content = m.get("content", "")
             input_msgs.append({
                 "role": m.get("role", "user"),
-                "content": [{"type": "text", "text": content}]
+                "content": content,
             })
 
         params = {
@@ -307,6 +317,8 @@ class OpenAIClient:
         if self._is_reasoning_model(model):
             params["reasoning"] = {"effort": default.get("reasoning_effort", "medium")}
 
+        # Do not attach response_format to Responses API params; use responses.parse(text_format=...) instead
+
         # Timeout is still honored via request options in SDK; keep here if needed by higher layer
         # Stop sequences are not yet mapped here; can be added if required.
 
@@ -320,8 +332,21 @@ class OpenAIClient:
         Extracts the response from the API response. Subclasses should
         override this method to implement their own response extraction.
         """
-        # Responses API: has output_text and output messages
+        # Responses API: prefer typed parsed output when available
         try:
+            if hasattr(response, "output_parsed") and response.output_parsed is not None:
+                parsed = response.output_parsed
+                try:
+                    # Pydantic v2 BaseModel
+                    content_text = parsed.model_dump_json()
+                except Exception:
+                    try:
+                        # Fallback to dict serialization
+                        import json
+                        content_text = json.dumps(getattr(parsed, "dict", lambda: parsed)())
+                    except Exception:
+                        content_text = str(parsed)
+                return {"role": "assistant", "content": content_text}
             if hasattr(response, "output_text") and response.output_text is not None:
                 return {"role": "assistant", "content": response.output_text}
         except Exception:
