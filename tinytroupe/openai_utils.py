@@ -9,6 +9,7 @@ from typing import Union
 
 
 import tiktoken
+from pydantic import BaseModel
 from tinytroupe import utils
 from tinytroupe.control import transactional
 from tinytroupe import default
@@ -227,7 +228,7 @@ class OpenAIClient:
         """
         Calls the OpenAI API with the given parameters. Subclasses should
         override this method to implement their own API calls.
-        """   
+        """
 
         # Choose API mode (legacy chat vs responses)
         api_mode = config["OpenAI"].get("API_MODE", "legacy").lower()
@@ -247,9 +248,8 @@ class OpenAIClient:
 
                 chat_api_params["reasoning_effort"] = default["reasoning_effort"]
 
-
         # To make the log cleaner, we remove the messages from the logged parameters
-        logged_params = {k: v for k, v in chat_api_params.items() if k != "messages"} 
+        logged_params = {k: v for k, v in chat_api_params.items() if k != "messages"}
 
         if api_mode == "responses":
             # Build Responses API params
