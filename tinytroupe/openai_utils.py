@@ -233,94 +233,88 @@ class OpenAIClient:
         """
         Calls the OpenAI API with the given parameters. Subclasses should
         override this method to implement their own API calls.
-        """   
-        
-        # Prefer Responses API when enabled; otherwise use legacy chat.completions
-        use_legacy = (self.api_mode != "responses")
+        """
 
-        if use_legacy:
-            # adjust parameters depending on the model (legacy path)
-            if self._is_reasoning_model(model):
-                # Reasoning models have slightly different parameters
-                if "stream" in chat_api_params:
-                    del chat_api_params["stream"]
-                for k in ["temperature", "top_p", "frequency_penalty", "presence_penalty"]:
-                    if k in chat_api_params:
-                        del chat_api_params[k]
-                if "max_tokens" in chat_api_params:
-                    chat_api_params["max_completion_tokens"] = chat_api_params["max_tokens"]
-                    del chat_api_params["max_tokens"]
+        # Choose API mode (legacy chat vs responses)
+        api_mode = config["OpenAI"].get("API_MODE", "legacy").lower()
+
+        # adjust parameters depending on the model (legacy path expectations)
+        if self._is_reasoning_model(model):
+            # Reasoning models have slightly different parameters
+            if api_mode == "legacy":
+                if "stream" in chat_api_params: del chat_api_params["stream"]
+                if "temperature" in chat_api_params: del chat_api_params["temperature"]
+                if "top_p" in chat_api_params: del chat_api_params["top_p"]
+                if "frequency_penalty" in chat_api_params: del chat_api_params["frequency_penalty"]
+                if "presence_penalty" in chat_api_params: del chat_api_params["presence_penalty"]
+
+                chat_api_params["max_completion_tokens"] = chat_api_params["max_tokens"]
+                del chat_api_params["max_tokens"]
+
                 chat_api_params["reasoning_effort"] = default["reasoning_effort"]
 
-            logged_params = {k: v for k, v in chat_api_params.items() if k != "messages"}
+        # To make the log cleaner, we remove the messages from the logged parameters
+        logged_params = {k: v for k, v in chat_api_params.items() if k != "messages"}
 
-            if "response_format" in chat_api_params and chat_api_params["response_format"] is not None:
-                # to enforce the response format via pydantic, we need to use the parse helper
-                if "stream" in chat_api_params:
-                    del chat_api_params["stream"]
-                logger.debug(f"Calling legacy .parse with params: {logged_params} (messages omitted).")
-                return self.client.beta.chat.completions.parse(**chat_api_params)
+        if api_mode == "responses":
+            # Build Responses API params
+            responses_params = self._build_responses_params(model, chat_api_params)
+
+            # Log sanitized params and full messages separately
+            rp_logged = {k: v for k, v in responses_params.items() if k != "input" and k != "messages"}
+            logger.debug(f"Calling LLM model (Responses API) with these parameters: {rp_logged}. Not showing 'messages'/'input' parameter.")
+            logger.debug(f"   --> Complete messages sent to LLM: {responses_params.get('messages') or responses_params.get('input')}")
+
+            # If using Pydantic model, prefer parse helper when available
+            if isinstance(chat_api_params.get("response_format"), type):
+                # Responses parse path with Pydantic model
+                return self.client.responses.parse(**responses_params)
             else:
-                logger.debug(f"Calling legacy chat.completions.create with params: {logged_params} (messages omitted).")
-                return self.client.chat.completions.create(**chat_api_params)
+                return self.client.responses.create(**responses_params)
 
-        # RESPONSES API path
-        rf = chat_api_params.get("response_format")
-        is_pydantic = isinstance(rf, type) and issubclass(rf, BaseModel)
+        # Legacy Chat Completions path
+        if "response_format" in chat_api_params:
+            if "stream" in chat_api_params:
+                del chat_api_params["stream"]
 
-        responses_params = self._map_messages_to_responses_params(model, chat_api_params)
-        logged_params = {k: v for k, v in responses_params.items() if k != "input"}
+            logger.debug(f"Calling LLM model (using .parse too) with these parameters: {logged_params}. Not showing 'messages' parameter.")
+            logger.debug(f"   --> Complete messages sent to LLM: {chat_api_params['messages']}")
+            return self.client.beta.chat.completions.parse(**chat_api_params)
+        else:
+            logger.debug(f"Calling LLM model with these parameters: {logged_params}. Not showing 'messages' parameter.")
+            return self.client.chat.completions.create(**chat_api_params)
 
-        if is_pydantic:
-            # Structured output via responses.parse with Pydantic text_format
-            logger.debug(f"Calling Responses API parse with params: {logged_params} (input omitted).")
-            return self.client.responses.parse(text_format=rf, **responses_params)
-
-        # Unstructured path
-        logger.debug(f"Calling Responses API create with params: {logged_params} (input omitted).")
-        return self.client.responses.create(**responses_params)
-
-    def _map_messages_to_responses_params(self, model, chat_api_params):
+    def _build_responses_params(self, model, chat_api_params):
         """
-        Convert legacy chat parameters into Responses API parameters.
-        - messages -> input (list of message dicts with plain string content)
-        - max_tokens -> max_output_tokens
-        - for reasoning models: set reasoning.effort and drop unsupported fields
+        Map legacy chat-style params to Responses API params.
+        - Prefer 'messages' as input if present; else use 'input'.
+        - Map max_tokens -> max_output_tokens
+        - For reasoning models add reasoning: { effort: ... } and drop sampling params.
+        - If response_format is a Pydantic model class, pass it directly (Responses parse supports Pydantic);
+          if it's a dict (JSON Schema), pass as-is with strict mode expected to be set by caller.
         """
-        # Map messages to Responses input
-        messages = chat_api_params.get("messages", [])
-        input_msgs = []
-        for m in messages:
-            content = m.get("content", "")
-            input_msgs.append({
-                "role": m.get("role", "user"),
-                "content": content,
-            })
-
         params = {
-            "model": chat_api_params.get("model"),
-            "input": input_msgs,
+            "model": model,
+            # Latest SDKs accept either 'input' or 'messages'. We pass both for compatibility; the SDK ignores the unused one.
+            "messages": chat_api_params.get("messages"),
+            "input": chat_api_params.get("messages"),
+            "max_output_tokens": chat_api_params.get("max_tokens"),
+            "timeout": chat_api_params.get("timeout"),
         }
 
-        # Temperature and sampling parameters are supported for non-reasoning models
-        if not self._is_reasoning_model(model):
-            if chat_api_params.get("temperature") is not None:
-                params["temperature"] = chat_api_params.get("temperature")
-            if chat_api_params.get("top_p") is not None:
-                params["top_p"] = chat_api_params.get("top_p")
+        # Include response_format (Pydantic class or JSON Schema dict)
+        if chat_api_params.get("response_format") is not None:
+            rf = chat_api_params["response_format"]
+            params["response_format"] = rf
 
-        # Map token limits
-        if chat_api_params.get("max_tokens") is not None:
-            params["max_output_tokens"] = chat_api_params.get("max_tokens")
-
-        # Reasoning model adjustments
+        # Reasoning models: remove sampling controls and set reasoning effort
         if self._is_reasoning_model(model):
-            params["reasoning"] = {"effort": default.get("reasoning_effort", "medium")}
-
-        # Do not attach response_format to Responses API params; use responses.parse(text_format=...) instead
-
-        # Timeout is still honored via request options in SDK; keep here if needed by higher layer
-        # Stop sequences are not yet mapped here; can be added if required.
+            params["reasoning"] = {"effort": default["reasoning_effort"]}
+        else:
+            # Non-reasoning: sampling controls are valid
+            for key in ("temperature", "top_p", "frequency_penalty", "presence_penalty"):
+                if chat_api_params.get(key) is not None:
+                    params[key] = chat_api_params[key]
 
         return params
 
@@ -329,30 +323,66 @@ class OpenAIClient:
 
     def _raw_model_response_extractor(self, response):
         """
-        Extracts the response from the API response. Subclasses should
-        override this method to implement their own response extraction.
+        Extract the response into a unified dict shape used by callers.
+        Supports both Chat Completions and Responses API return shapes.
         """
-        # Responses API: prefer typed parsed output when available
+        # Legacy chat path
+        if hasattr(response, "choices"):
+            return response.choices[0].message.to_dict()
+
+        # Responses API path
         try:
-            if hasattr(response, "output_parsed") and response.output_parsed is not None:
-                parsed = response.output_parsed
+            # Try to obtain a dict-like representation
+            resp_dict = None
+            if hasattr(response, "to_dict"):
+                resp_dict = response.to_dict()
+            elif hasattr(response, "model_dump"):
+                resp_dict = response.model_dump()
+
+            # Fall back to attribute traversal if needed
+            output_items = None
+            if resp_dict is not None:
+                output_items = resp_dict.get("output") or resp_dict.get("outputs")
+            else:
+                output_items = getattr(response, "output", None) or getattr(response, "outputs", None)
+
+            role = "assistant"
+            content_text = None
+            parsed = None
+            refusal = None
+
+            if output_items:
+                # Expect the first item to be a message with content parts
+                first = output_items[0]
+                contents = first.get("content") if isinstance(first, dict) else getattr(first, "content", [])
+                for part in contents or []:
+                    ptype = part.get("type") if isinstance(part, dict) else getattr(part, "type", None)
+                    # Text output
+                    if ptype in ("output_text", "text"):
+                        content_text = part.get("text") if isinstance(part, dict) else getattr(part, "text", None)
+                    # Structured parse
+                    if (isinstance(part, dict) and "parsed" in part):
+                        parsed = part.get("parsed")
+                    elif hasattr(part, "parsed"):
+                        parsed = getattr(part, "parsed")
+                    # Refusal
+                    if (isinstance(part, dict) and "refusal" in part):
+                        refusal = part.get("refusal")
+                    elif hasattr(part, "refusal"):
+                        refusal = getattr(part, "refusal")
+
+            # As a final fallback, try convenience property 'output_text'
+            if content_text is None and hasattr(response, "output_text"):
                 try:
-                    # Pydantic v2 BaseModel
-                    content_text = parsed.model_dump_json()
+                    content_text = response.output_text
                 except Exception:
-                    try:
-                        # Fallback to dict serialization
-                        import json
-                        content_text = json.dumps(getattr(parsed, "dict", lambda: parsed)())
-                    except Exception:
-                        content_text = str(parsed)
-                return {"role": "assistant", "content": content_text}
-            if hasattr(response, "output_text") and response.output_text is not None:
-                return {"role": "assistant", "content": response.output_text}
-        except Exception:
-            pass
-        # Legacy chat.completions path
-        return response.choices[0].message.to_dict()
+                    pass
+
+            return {"role": role, "content": content_text, "parsed": parsed, "refusal": refusal}
+        except Exception as e:
+            logger.error(f"Failed to extract Responses API payload: {e}")
+            # best-effort fallback
+            return {"role": "assistant", "content": None, "parsed": None, "refusal": None}
 
     def _count_tokens(self, messages: list, model: str):
         """
